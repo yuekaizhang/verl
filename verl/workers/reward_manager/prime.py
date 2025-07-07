@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import asyncio
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from functools import partial
 from typing import Callable, Optional
 
@@ -46,7 +46,7 @@ async def parallel_compute_score_async(
     if extra_info is None:
         extra_info = [None] * len(tasks)
     scores = []
-    with ProcessPoolExecutor(max_workers=num_processes) as executor:
+    with ThreadPoolExecutor(max_workers=num_processes) as executor:
         # to prevent very occasional starvation caused by some anomalous programs ( like infinite loop ), the
         # exceptions in async programs will instantly halt the evaluation, and all summoned processes will be killed.
         try:
@@ -61,18 +61,26 @@ async def parallel_compute_score_async(
             raise
         finally:
             terminated_count = 0
-            for pid, proc in executor._processes.items():
-                try:
-                    p = psutil.Process(pid)
-                    p.terminate()
+            # In ThreadPoolExecutor there is no `_processes` attribute, whereas ProcessPoolExecutor
+            # does maintain this for its worker processes. We guard against accessing this
+            # private attribute so the cleanup works for either executor type.
+            if hasattr(executor, "_processes"):
+                for pid, proc in executor._processes.items():
                     try:
-                        p.wait(timeout=5)
-                    except psutil.TimeoutExpired:
-                        p.kill()
-                    terminated_count += 1
-                except Exception:
-                    pass
-            print(f"[Shutdown] {terminated_count} subprocess(es) terminated.")
+                        p = psutil.Process(pid)
+                        p.terminate()
+                        try:
+                            p.wait(timeout=5)
+                        except psutil.TimeoutExpired:
+                            p.kill()
+                        terminated_count += 1
+                    except Exception:
+                        pass
+                print(f"[Shutdown] {terminated_count} subprocess(es) terminated.")
+            else:
+                # For ThreadPoolExecutor no extra cleanup is required; the context manager takes
+                # care of shutting down the thread workers. We emit a log line for consistency.
+                print("[Shutdown] ThreadPoolExecutor terminated.")
 
     # Process results
     for result, completion, reference, task in zip(results, completions, references, tasks):
