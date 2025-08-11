@@ -20,6 +20,7 @@ from typing import Callable, Optional
 import psutil
 import torch
 from transformers import PreTrainedTokenizer
+from collections import defaultdict  # Added to aggregate extra reward information
 
 from verl import DataProto
 from verl.utils.reward_score import default_compute_score
@@ -43,9 +44,22 @@ async def single_compute_score(evaluation_func, completion, reference, task, tas
 async def parallel_compute_score_async(
     evaluation_func, completions, references, tasks, extra_info=None, num_processes=64
 ):
+    """Run *evaluation_func* for each sample in parallel threads.
+
+    Returns
+    -------
+    scores : List[float]
+        Numeric reward for each sample.
+    reward_extra_info : defaultdict(list)
+        Aggregated extra information (if ``evaluation_func`` returns dict).
+    """
+
     if extra_info is None:
         extra_info = [None] * len(tasks)
+
     scores = []
+    reward_extra_info = defaultdict(list)
+
     with ThreadPoolExecutor(max_workers=num_processes) as executor:
         # to prevent very occasional starvation caused by some anomalous programs ( like infinite loop ), the
         # exceptions in async programs will instantly halt the evaluation, and all summoned processes will be killed.
@@ -84,22 +98,42 @@ async def parallel_compute_score_async(
 
     # Process results
     for result, completion, reference, task in zip(results, completions, references, tasks):
+        # Default numeric reward
+        numeric_reward: float = 0.0
+
         if isinstance(result, Exception) or result is None:
-            # Handle failed or timed-out tasks
-            scores.append(0.0)
+            numeric_reward = 0.0
         elif isinstance(result, (int, float, bool)):
-            scores.append(float(result))
+            numeric_reward = float(result)
+        elif isinstance(result, dict):
+            # If compute_score returns a dict, extract numeric score and aggregate extras
+            numeric_reward = float(result.get("score", 0.0))
+            for key, value in result.items():
+                reward_extra_info[key].append(value)
         else:
-            scores.append(float(result[0]))
-    return scores
+            # Fallback – try to treat result like a sequence/tuple
+            try:
+                numeric_reward = float(result[0])
+            except Exception:
+                numeric_reward = 0.0
+
+        scores.append(numeric_reward)
+
+    return scores, reward_extra_info
 
 
-def run_reward_scoring(evaluation_func, completions, references, tasks, extra_info=None, num_processes=64):
+def run_reward_scoring(
+    evaluation_func, completions, references, tasks, extra_info=None, num_processes=64
+):
+    """Wrapper to run *parallel_compute_score_async* inside a fresh event loop."""
+
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     try:
         return loop.run_until_complete(
-            parallel_compute_score_async(evaluation_func, completions, references, tasks, extra_info, num_processes)
+            parallel_compute_score_async(
+                evaluation_func, completions, references, tasks, extra_info, num_processes
+            )
         )
     finally:
         loop.close()
@@ -138,7 +172,7 @@ class PrimeRewardManager:
 
         assert len(sequences_str) == len(ground_truth) == len(data_sources)
         try:
-            scores = run_reward_scoring(
+            scores, reward_extra_info = run_reward_scoring(
                 self.compute_score,
                 completions=sequences_str,
                 references=ground_truth,
@@ -153,42 +187,66 @@ class PrimeRewardManager:
             print(f"[Error] Unexpected error during scoring. Setting all as 0. {e}")
             scores = [0.0 for _ in range(len(sequences_str))]
         data.batch["acc"] = torch.tensor(scores, dtype=torch.float32, device=prompt_ids.device)
-        return scores
+        return scores, reward_extra_info
 
     def __call__(self, data: DataProto, return_dict: bool = False):
-        """We will expand this function gradually based on the available datasets"""
+        """Compute reward for each sample. If ``compute_score`` returns a dict, the extra fields
+        are collected in ``reward_extra_info`` similarly to :class:`NaiveRewardManager`."""
 
-        # If there is rm score, we directly return rm score. Otherwise, we compute via rm_score_fn
+        # If rm_scores already exist, return them directly.
         if "rm_scores" in data.batch.keys():
+            if return_dict:
+                return {"reward_tensor": data.batch["rm_scores"]}
             return data.batch["rm_scores"]
 
         reward_tensor = torch.zeros_like(data.batch["responses"], dtype=torch.float32)
 
+        # Run verification (asynchronous scoring)
+        scores, reward_extra_info = self.verify(data)
+
         already_print_data_sources = {}
 
-        # batched scoring
-        prompt_ids = data.batch["prompts"]
-        prompt_length = prompt_ids.shape[-1]
+        # Prepare batch-level tensors/metadata
+        response_ids_batch = data.batch["responses"]
+        sequences_str = self.tokenizer.batch_decode(response_ids_batch, skip_special_tokens=True)
 
-        response_ids = data.batch["responses"]
+        prompt_ids_batch = data.batch["prompts"]
+        prompt_length = prompt_ids_batch.shape[-1]
         valid_response_length = data.batch["attention_mask"][:, prompt_length:].sum(dim=-1)
-        sequences_str = self.tokenizer.batch_decode(response_ids, skip_special_tokens=True)
-        data_sources = data.non_tensor_batch["data_source"]
-
-        scores = self.verify(data)
 
         for i in range(len(data)):
-            data_source = data_sources[i]
-            reward_tensor[i, valid_response_length[i].item() - 1] = scores[i]
+            data_item = data[i]
 
+            # Decode prompt for debugging
+            valid_prompt_len = int(data_item.batch["attention_mask"][:prompt_length].sum().item())
+            prompt_str = self.tokenizer.decode(
+                data_item.batch["prompts"][-valid_prompt_len:], skip_special_tokens=True
+            )
+
+            response_str = sequences_str[i]
+
+            data_source = data_item.non_tensor_batch[self.reward_fn_key]
+
+            reward_val = scores[i]
+            reward_tensor[i, valid_response_length[i].item() - 1] = float(reward_val)
+
+            # Controlled debug printing
             if data_source not in already_print_data_sources:
                 already_print_data_sources[data_source] = 0
-
             if already_print_data_sources[data_source] < self.num_examine:
                 already_print_data_sources[data_source] += 1
-                print(sequences_str)
+                print("[prompt]", prompt_str)
+                print("[response]", response_str)
+                if reward_extra_info:
+                    for key, value_list in reward_extra_info.items():
+                        if len(value_list) > i:
+                            print(f"[{key}]", value_list[i])
+                else:
+                    print("[score]", reward_val)
 
         if return_dict:
-            return {"reward_tensor": reward_tensor}
-        else:
-            return reward_tensor
+            return {
+                "reward_tensor": reward_tensor,
+                "reward_extra_info": reward_extra_info,
+            }
+        return reward_tensor
